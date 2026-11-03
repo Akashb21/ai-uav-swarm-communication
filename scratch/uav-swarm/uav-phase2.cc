@@ -8,7 +8,11 @@
 #include "ns3/network-module.h"
 #include "ns3/propagation-module.h"
 #include "ns3/wifi-module.h"
-
+#include "ns3/ipv4-l3-protocol.h"
+#include "ns3/seq-ts-header.h"
+#include "ns3/udp-header.h"
+#include <map>
+#include "ns3/address.h"
 #include "airsim-udp-bridge.h"
 
 #include <cmath>
@@ -43,6 +47,22 @@ static double g_airSimOffsetY = 0.0;
 static double g_airSimOffsetZ = 0.0;
 
 static const double g_neighborRange = 150.0;
+
+struct AppPacketRecord
+{
+    uint32_t sequence{0};
+    double txTimeS{0.0};
+    double rxTimeS{-1.0};
+    bool received{false};
+    std::vector<uint32_t> forwarders;
+};
+
+static std::map<uint32_t, AppPacketRecord> g_packetRecords;
+static uint32_t g_nextAppSequence = 0;
+static Ipv4Address g_flowSourceAddress;
+static Ipv4Address g_flowDestinationAddress;
+static std::vector<uint64_t> g_forwardedByUav;
+static std::vector<uint64_t> g_droppedByUav;
 
 struct AirSimMobilityContext
 {
@@ -92,13 +112,31 @@ PollAirSimMobility(AirSimMobilityContext* context)
         {
             Vector position = TransformAirSimPosition(*state);
             Vector velocity = TransformAirSimVelocity(*state);
+
             model->SetPosition(position);
+
+            Ptr<ConstantVelocityMobilityModel> velocityModel =
+                DynamicCast<ConstantVelocityMobilityModel>(model);
+
+            if (velocityModel != nullptr)
+            {
+                velocityModel->SetVelocity(velocity);
+            }
+
             context->lastPosition[i] = position;
             context->hasPosition[i] = true;
             context->stale[i] = false;
-            context->log << std::fixed << std::setprecision(6) << now << ',' << i << ",Drone" << i + 1
-                         << ',' << position.x << ',' << position.y << ',' << position.z << ',' << velocity.x
-                         << ',' << velocity.y << ',' << velocity.z << ',' << state->timestamp << ",0\n";
+
+            context->log << std::fixed << std::setprecision(6)
+                        << now << ',' << i << ",Drone" << i + 1
+                        << ',' << position.x
+                        << ',' << position.y
+                        << ',' << position.z
+                        << ',' << velocity.x
+                        << ',' << velocity.y
+                        << ',' << velocity.z
+                        << ',' << state->timestamp
+                        << ",0\n";
         }
         else if (state != nullptr)
         {
@@ -217,6 +255,143 @@ ChangeMobility(NodeContainer nodes)
                     -1.0,
                     0.0));
         }
+    }
+}
+
+
+// ============================================================
+// packet delivery
+// ============================================================
+
+static bool
+IsTrackedDataFlow(const Ipv4Header& header)
+{
+    return header.GetProtocol() == 17 && // UDP
+           header.GetSource() == g_flowSourceAddress &&
+           header.GetDestination() == g_flowDestinationAddress;
+}
+
+static bool
+ExtractUdpSequence(Ptr<const Packet> packet, uint32_t& sequence)
+{
+    if (packet == nullptr)
+    {
+        return false;
+    }
+
+    Ptr<Packet> copy = packet->Copy();
+
+    UdpHeader udpHeader;
+    if (copy->RemoveHeader(udpHeader) == 0)
+    {
+        return false;
+    }
+
+    SeqTsHeader seqHeader;
+    if (copy->RemoveHeader(seqHeader) == 0)
+    {
+        return false;
+    }
+
+    sequence = seqHeader.GetSeq();
+    return true;
+}
+
+// UdpClient's Tx trace fires for each generated application packet.
+// The callback order follows UdpClient's SeqTsHeader sequence order.
+static void
+OnTrackedApplicationTx(Ptr<const Packet> packet)
+{
+    (void)packet;
+
+    const uint32_t sequence = g_nextAppSequence++;
+    AppPacketRecord& record = g_packetRecords[sequence];
+    record.sequence = sequence;
+    record.txTimeS = Simulator::Now().GetSeconds();
+}
+
+// IPv4 UnicastForward fires at an intermediate UAV when it forwards this flow.
+static void
+OnTrackedFlowForward(uint32_t nodeId,
+                     const Ipv4Header& header,
+                     Ptr<const Packet> packet,
+                     uint32_t interface)
+{
+    (void)interface;
+
+    if (!IsTrackedDataFlow(header) || nodeId == 0 ||
+        nodeId + 1 == g_numUavs)
+    {
+        return;
+    }
+
+    ++g_forwardedByUav.at(nodeId);
+
+    uint32_t sequence = 0;
+    if (ExtractUdpSequence(packet, sequence))
+    {
+        auto it = g_packetRecords.find(sequence);
+        if (it != g_packetRecords.end())
+        {
+            if (it->second.forwarders.empty() ||
+                it->second.forwarders.back() != nodeId)
+            {
+                it->second.forwarders.push_back(nodeId);
+            }
+        }
+    }
+}
+
+// IPv4 Drop records network-layer drops for the tracked UDP flow.
+static void
+OnTrackedFlowDrop(uint32_t nodeId,
+                  const Ipv4Header& header,
+                  Ptr<const Packet> packet,
+                  Ipv4L3Protocol::DropReason reason,
+                  Ptr<Ipv4> ipv4,
+                  uint32_t interface)
+{
+    (void)packet;
+    (void)reason;
+    (void)ipv4;
+    (void)interface;
+
+    if (IsTrackedDataFlow(header) && nodeId != 0 &&
+        nodeId + 1 != g_numUavs)
+    {
+        ++g_droppedByUav.at(nodeId);
+    }
+}
+
+// UdpServer's Rx trace is fired before UdpServer removes its SeqTsHeader.
+// UdpServer Rx callback: receives Packet and sender Address.
+static void
+OnTrackedApplicationRx(Ptr<const Packet> packet, const Address& from)
+{
+    (void)from;
+
+    if (packet == nullptr)
+    {
+        return;
+    }
+
+    Ptr<Packet> copy = packet->Copy();
+
+    SeqTsHeader seqHeader;
+
+    if (copy->RemoveHeader(seqHeader) == 0)
+    {
+        return;
+    }
+
+    auto it = g_packetRecords.find(seqHeader.GetSeq());
+
+    if (it != g_packetRecords.end() &&
+        !it->second.received)
+    {
+        it->second.received = true;
+        it->second.rxTimeS =
+            Simulator::Now().GetSeconds();
     }
 }
 
@@ -383,9 +558,7 @@ main(int argc, char* argv[])
 
     mobility.SetPositionAllocator(
         positionAllocator);
-
-    mobility.SetMobilityModel(g_useAirSim ? "ns3::ConstantPositionMobilityModel"
-                                          : "ns3::ConstantVelocityMobilityModel");
+    mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
 
     mobility.Install(uavs);
 
@@ -456,24 +629,35 @@ main(int argc, char* argv[])
     // 2.412 GHz = 802.11g channel 1.
     // --------------------------------------------------------
 
-    YansWifiChannelHelper channel;
+// ============================================================
+// Wi-Fi channel with a 150-metre communication range
+// ============================================================
 
-    channel.SetPropagationDelay(
-        "ns3::ConstantSpeedPropagationDelayModel");
+YansWifiChannelHelper channel;
 
-    channel.AddPropagationLoss(
-        "ns3::FriisPropagationLossModel",
-        "Frequency",
-        DoubleValue(2.412e9));
+channel.SetPropagationDelay(
+    "ns3::ConstantSpeedPropagationDelayModel");
 
+// Calculate free-space path loss.
+channel.AddPropagationLoss(
+    "ns3::FriisPropagationLossModel",
+    "Frequency",
+    DoubleValue(2.412e9));
+
+// Enforce maximum communication distance.
+channel.AddPropagationLoss(
+    "ns3::RangePropagationLossModel",
+    "MaxRange",
+    DoubleValue(g_neighborRange));
+
+    // Configure Wi-Fi PHY and connect it to the channel.
     YansWifiPhyHelper phy;
-
-    phy.SetChannel(
-        channel.Create());
+    phy.SetChannel(channel.Create());
 
     // --------------------------------------------------------
     // Wi-Fi
     // --------------------------------------------------------
+
 
     WifiHelper wifi;
 
@@ -529,6 +713,40 @@ main(int argc, char* argv[])
 
     Ipv4InterfaceContainer interfaces =
         ipv4.Assign(devices);
+
+    g_flowSourceAddress = interfaces.GetAddress(0);
+g_flowDestinationAddress = interfaces.GetAddress(g_numUavs - 1);
+g_forwardedByUav.assign(g_numUavs, 0);
+g_droppedByUav.assign(g_numUavs, 0);
+
+for (uint32_t i = 0; i < g_numUavs; ++i)
+{
+    Ptr<Ipv4L3Protocol> ipv4L3 = uavs.Get(i)->GetObject<Ipv4L3Protocol>();
+    if (ipv4L3 == nullptr)
+    {
+        std::cerr << "[ERROR] Could not access IPv4 L3 protocol for UAV "
+                  << i << "\n";
+        return 1;
+    }
+
+    if (!ipv4L3->TraceConnectWithoutContext(
+            "UnicastForward",
+            MakeBoundCallback(&OnTrackedFlowForward, i)))
+    {
+        std::cerr << "[ERROR] Could not connect UnicastForward trace for UAV "
+                  << i << "\n";
+        return 1;
+    }
+
+    if (!ipv4L3->TraceConnectWithoutContext(
+            "Drop",
+            MakeBoundCallback(&OnTrackedFlowDrop, i)))
+    {
+        std::cerr << "[ERROR] Could not connect IPv4 Drop trace for UAV "
+                  << i << "\n";
+        return 1;
+    }
+}
 
     // Neighbor output is retained for analysis/plot.py.  Rows are directed and include
     // all UAV pairs within the documented 150 m analysis neighborhood range.
@@ -620,6 +838,12 @@ main(int argc, char* argv[])
     ApplicationContainer serverApps =
         server.Install(
             uavs.Get(g_numUavs - 1));
+    if (!serverApps.Get(0)->TraceConnectWithoutContext(
+        "Rx", MakeCallback(&OnTrackedApplicationRx)))
+{
+    std::cerr << "[ERROR] Could not connect UdpServer Rx trace\n";
+    return 1;
+}
 
     serverApps.Start(
         Seconds(1.0));
@@ -654,6 +878,12 @@ main(int argc, char* argv[])
     ApplicationContainer clientApps =
         client.Install(
             uavs.Get(0));
+    if (!clientApps.Get(0)->TraceConnectWithoutContext(
+        "Tx", MakeCallback(&OnTrackedApplicationTx)))
+{
+    std::cerr << "[ERROR] Could not connect UdpClient Tx trace\n";
+    return 1;
+}
 
     // Give AODV time to initialize.
     clientApps.Start(
@@ -705,6 +935,139 @@ main(int argc, char* argv[])
         airSimContext->log.close();
     }
     neighborFile.close();
+
+    uint64_t appTxPackets = g_packetRecords.size();
+uint64_t appRxPackets = 0;
+for (const auto& entry : g_packetRecords)
+{
+    if (entry.second.received)
+    {
+        ++appRxPackets;
+    }
+}
+
+const uint64_t appLostPackets =
+    (appTxPackets >= appRxPackets) ? appTxPackets - appRxPackets : 0;
+
+const double appPdrPercent =
+    (appTxPackets > 0)
+        ? 100.0 * static_cast<double>(appRxPackets) /
+              static_cast<double>(appTxPackets)
+        : 0.0;
+
+const double appLossPercent =
+    (appTxPackets > 0)
+        ? 100.0 * static_cast<double>(appLostPackets) /
+              static_cast<double>(appTxPackets)
+        : 0.0;
+
+// One row per application packet.
+std::ofstream deliveryFile("results/phase2/packet-delivery.csv");
+if (!deliveryFile.is_open())
+{
+    std::cerr << "[ERROR] Could not open packet-delivery.csv\n";
+    return 1;
+}
+
+deliveryFile
+    << "packet_id,source_uav,destination_uav,tx_time_s,rx_time_s,"
+       "end_to_end_delay_ms,hop_count,forwarding_path,status\n";
+
+for (const auto& entry : g_packetRecords)
+{
+    const AppPacketRecord& record = entry.second;
+    std::string path = "UAV0";
+
+    for (uint32_t forwarder : record.forwarders)
+    {
+        path += ">UAV" + std::to_string(forwarder);
+    }
+    path += ">UAV" + std::to_string(g_numUavs - 1);
+
+    const uint32_t hopCount =
+        static_cast<uint32_t>(record.forwarders.size()) + 1;
+
+    deliveryFile << record.sequence << ",0," << (g_numUavs - 1) << ","
+                 << std::fixed << std::setprecision(6) << record.txTimeS << ",";
+
+    if (record.received)
+    {
+        const double delayMs = (record.rxTimeS - record.txTimeS) * 1000.0;
+        deliveryFile << record.rxTimeS << "," << delayMs << ",";
+    }
+    else
+    {
+        deliveryFile << ",,";
+    }
+
+    deliveryFile << hopCount << "," << path << ","
+                 << (record.received ? "DELIVERED" : "LOST") << "\n";
+}
+deliveryFile.close();
+
+// Application-level end-to-end PDR.
+std::ofstream pdrFile("results/phase2/pdr-results.csv");
+if (!pdrFile.is_open())
+{
+    std::cerr << "[ERROR] Could not open pdr-results.csv\n";
+    return 1;
+}
+pdrFile << "tx_packets,rx_packets,pdr_percent\n"
+        << appTxPackets << "," << appRxPackets << ","
+        << std::fixed << std::setprecision(4) << appPdrPercent << "\n";
+pdrFile.close();
+
+// Application-level end-to-end packet loss.
+std::ofstream lossFile("results/phase2/packet-loss.csv");
+if (!lossFile.is_open())
+{
+    std::cerr << "[ERROR] Could not open packet-loss.csv\n";
+    return 1;
+}
+lossFile << "tx_packets,rx_packets,lost_packets,loss_percent\n"
+         << appTxPackets << "," << appRxPackets << ","
+         << appLostPackets << ","
+         << std::fixed << std::setprecision(4) << appLossPercent << "\n";
+lossFile.close();
+
+// Forwarding-reliability estimate for intermediate UAVs only.
+std::ofstream trustFile("results/phase2/trust-scores.csv");
+if (!trustFile.is_open())
+{
+    std::cerr << "[ERROR] Could not open trust-scores.csv\n";
+    return 1;
+}
+trustFile << "uav_id,role,forward_events,ip_drop_events,observed_events,"
+             "forwarding_trust_score_percent,status\n";
+
+for (uint32_t i = 0; i < g_numUavs; ++i)
+{
+    const bool endpoint = (i == 0 || i == g_numUavs - 1);
+    const uint64_t forwarded = g_forwardedByUav[i];
+    const uint64_t dropped = g_droppedByUav[i];
+    const uint64_t observed = forwarded + dropped;
+
+    trustFile << i << "," << (endpoint ? "ENDPOINT" : "INTERMEDIATE")
+              << "," << forwarded << "," << dropped << "," << observed << ",";
+
+    if (endpoint)
+    {
+        trustFile << "NA,ENDPOINT_NOT_SCORED\n";
+    }
+    else if (observed == 0)
+    {
+        trustFile << "NA,NO_TRANSIT_OBSERVATIONS\n";
+    }
+    else
+    {
+        const double score =
+            100.0 * static_cast<double>(forwarded) /
+            static_cast<double>(observed);
+        trustFile << std::fixed << std::setprecision(4)
+                  << score << ",OBSERVED\n";
+    }
+}
+trustFile.close();
 
     // --------------------------------------------------------
     // FlowMonitor statistics
@@ -906,6 +1269,12 @@ main(int argc, char* argv[])
         << throughputKbps
         << "\n";
 
+    summaryFile << "application_tx_packets," << appTxPackets << "\n";
+summaryFile << "application_rx_packets," << appRxPackets << "\n";
+summaryFile << "application_lost_packets," << appLostPackets << "\n";
+summaryFile << "application_pdr_percent," << appPdrPercent << "\n";
+summaryFile << "application_packet_loss_percent," << appLossPercent << "\n";
+
     summaryFile.close();
 
     // --------------------------------------------------------
@@ -1001,6 +1370,11 @@ main(int argc, char* argv[])
 
     std::cout
         << "  results/phase2/neighbors.csv\n";
+
+    std::cout << "  results/phase2/pdr-results.csv\n";
+std::cout << "  results/phase2/packet-loss.csv\n";
+std::cout << "  results/phase2/trust-scores.csv\n";
+std::cout << "  results/phase2/packet-delivery.csv\n";
 
     if (g_useAirSim)
     {
